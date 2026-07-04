@@ -2,3 +2,5 @@
 **/*.rs.bk
 *.pdb
 .DS_Store
+# 本地专用的 crates 镜像配置，不提交（否则会拖慢/搞坏 CI）
+.cargo/

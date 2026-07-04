@@ -59,6 +59,7 @@ impl Default for AppConfig {
             active_profile: None,
             effect_volume: 1.0,
             mic_passthrough: true,
+            stop_hotkey: None,
             autostart: false,
         }
     }
