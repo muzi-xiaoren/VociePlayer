@@ -1,0 +1,120 @@
+name: Build Windows
+
+# push 到 main / 手动触发：构建并上传可下载 artifact。
+# 推 v 开头的 tag（如 v0.0.1）：额外把绿色版 zip + 安装包发到 Release。
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Build Windows
+    runs-on: windows-latest
+    env:
+      # 静态链接 CRT，产物是单个 exe，用户机器无需装 VC 运行库。
+      RUSTFLAGS: "-C target-feature=+crt-static"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Package portable zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/vocieplayer.exe dist/VociePlayer.exe
+          Compress-Archive -Path dist/VociePlayer.exe -DestinationPath VociePlayer-Windows.zip -Force
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          $iss = @"
+          [Setup]
+          AppId={{B7F2C1A4-9D3E-4C6B-8A15-3E9D2C1A4F60}
+          AppName=VociePlayer
+          AppVersion=$version
+          AppPublisher=muzi-xiaoren
+          DefaultDirName={autopf}\VociePlayer
+          DefaultGroupName=VociePlayer
+          OutputDir=$env:GITHUB_WORKSPACE
+          OutputBaseFilename=VociePlayer-Setup
+          Compression=lzma
+          SolidCompression=yes
+          WizardStyle=modern
+
+          [Files]
+          Source: "$env:GITHUB_WORKSPACE\target\release\vocieplayer.exe"; DestDir: "{app}"; DestName: "VociePlayer.exe"; Flags: ignoreversion
+
+          [Icons]
+          Name: "{group}\VociePlayer"; Filename: "{app}\VociePlayer.exe"
+          Name: "{autodesktop}\VociePlayer"; Filename: "{app}\VociePlayer.exe"; Tasks: desktopicon
+
+          [Tasks]
+          Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加图标:"; Flags: unchecked
+
+          [Run]
+          Filename: "{app}\VociePlayer.exe"; Description: "启动 VociePlayer"; Flags: nowait postinstall skipifsilent
+          "@
+          Set-Content -Path installer.iss -Value $iss -Encoding UTF8
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" installer.iss
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VociePlayer-Windows
+          path: |
+            VociePlayer-Windows.zip
+            VociePlayer-Setup.exe
+          if-no-files-found: error
+
+  release:
+    name: Publish Release
+    needs: windows
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect release files
+        run: |
+          mkdir -p release
+          cp artifacts/VociePlayer-Windows/VociePlayer-Windows.zip release/
+          cp artifacts/VociePlayer-Windows/VociePlayer-Setup.exe   release/
+          ls -lh release
+
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          body: |
+            ## 📦 下载
+
+            | 文件 | 说明 |
+            |---|---|
+            | **VociePlayer-Setup.exe** | 推荐，安装版 |
+            | VociePlayer-Windows.zip | 免安装绿色版，解压即用 |
+
+            ## 🔧 首次使用
+            1. 先装 [VB-CABLE](https://vb-audio.com/Cable/)（免费虚拟声卡）并重启。
+            2. 打开 VociePlayer，输出设备选 **CABLE Input**。
+            3. 在游戏 / Discord 里把麦克风设成 **CABLE Output**。
+            4. 把音频拖进配置文件夹、绑定快捷键即可。
+
+            > Windows 弹 SmartScreen：点「更多信息」→「仍要运行」。
