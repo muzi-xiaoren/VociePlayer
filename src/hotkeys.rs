@@ -2,11 +2,16 @@
 //!
 //! 快捷键字符串由界面里「按键捕获」生成（见 `from_egui`），也可手改。
 //! 我们自己在字符串 <-> `global_hotkey::HotKey` 之间转换，不依赖第三方解析格式。
+//!
+//! 事件处理在独立线程（`spawn_listener`）里阻塞等待，不依赖 UI 刷帧——
+//! 窗口被全屏游戏遮挡、最小化时热键照样响。数字键会同时注册主键盘和
+//! 小键盘两个键位，按哪边都能触发。
 
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
-use global_hotkey::{GlobalHotKeyManager, GlobalHotKeyEvent, HotKeyState};
+use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 /// 热键触发后要做的事。
 #[derive(Debug, Clone)]
@@ -14,6 +19,9 @@ pub enum HkAction {
     Play { path: PathBuf, volume: f32 },
     StopAll,
 }
+
+/// 「热键 id -> 动作」映射，注册线程（UI）和监听线程共享。
+pub type SharedActions = Arc<Mutex<HashMap<u32, HkAction>>>;
 
 /// 把界面捕获到的（修饰键 + 主键）拼成展示字符串，如 "Ctrl+Alt+S"。
 /// 返回 None 表示这个键我们不支持绑定。
@@ -37,10 +45,11 @@ pub fn from_egui(mods: &egui::Modifiers, key: egui::Key) -> Option<String> {
     Some(s)
 }
 
-/// 解析 "Ctrl+Alt+S" -> HotKey。失败返回 None。
-pub fn parse(combo: &str) -> Option<HotKey> {
+/// 解析 "Ctrl+Alt+1" -> 一批 HotKey（数字/回车会展开成主键盘+小键盘两个）。
+/// 解析失败返回空 Vec。
+pub fn parse_all(combo: &str) -> Vec<HotKey> {
     let mut mods = Modifiers::empty();
-    let mut code: Option<Code> = None;
+    let mut codes: Vec<Code> = Vec::new();
     for part in combo.split('+').map(|p| p.trim()).filter(|p| !p.is_empty()) {
         match part.to_lowercase().as_str() {
             "ctrl" | "control" => mods |= Modifiers::CONTROL,
@@ -48,12 +57,11 @@ pub fn parse(combo: &str) -> Option<HotKey> {
             "shift" => mods |= Modifiers::SHIFT,
             // Win/Super/Cmd 键暂不支持绑定，忽略这个修饰符
             "win" | "super" | "meta" | "cmd" => {}
-            _ => code = token_to_code(part),
+            _ => codes = token_to_codes(part),
         }
     }
-    let code = code?;
     let m = if mods.is_empty() { None } else { Some(mods) };
-    Some(HotKey::new(m, code))
+    codes.into_iter().map(|c| HotKey::new(m, c)).collect()
 }
 
 fn egui_key_token(key: egui::Key) -> Option<&'static str> {
@@ -75,35 +83,49 @@ fn egui_key_token(key: egui::Key) -> Option<&'static str> {
     })
 }
 
-fn token_to_code(t: &str) -> Option<Code> {
-    Some(match t.to_uppercase().as_str() {
-        "A" => Code::KeyA, "B" => Code::KeyB, "C" => Code::KeyC, "D" => Code::KeyD,
-        "E" => Code::KeyE, "F" => Code::KeyF, "G" => Code::KeyG, "H" => Code::KeyH,
-        "I" => Code::KeyI, "J" => Code::KeyJ, "K" => Code::KeyK, "L" => Code::KeyL,
-        "M" => Code::KeyM, "N" => Code::KeyN, "O" => Code::KeyO, "P" => Code::KeyP,
-        "Q" => Code::KeyQ, "R" => Code::KeyR, "S" => Code::KeyS, "T" => Code::KeyT,
-        "U" => Code::KeyU, "V" => Code::KeyV, "W" => Code::KeyW, "X" => Code::KeyX,
-        "Y" => Code::KeyY, "Z" => Code::KeyZ,
-        "0" => Code::Digit0, "1" => Code::Digit1, "2" => Code::Digit2, "3" => Code::Digit3,
-        "4" => Code::Digit4, "5" => Code::Digit5, "6" => Code::Digit6, "7" => Code::Digit7,
-        "8" => Code::Digit8, "9" => Code::Digit9,
-        "F1" => Code::F1, "F2" => Code::F2, "F3" => Code::F3, "F4" => Code::F4,
-        "F5" => Code::F5, "F6" => Code::F6, "F7" => Code::F7, "F8" => Code::F8,
-        "F9" => Code::F9, "F10" => Code::F10, "F11" => Code::F11, "F12" => Code::F12,
-        "SPACE" => Code::Space, "ENTER" => Code::Enter, "TAB" => Code::Tab,
-        "BACKSPACE" => Code::Backspace, "INSERT" => Code::Insert, "DELETE" => Code::Delete,
-        "HOME" => Code::Home, "END" => Code::End, "PAGEUP" => Code::PageUp,
-        "PAGEDOWN" => Code::PageDown, "UP" => Code::ArrowUp, "DOWN" => Code::ArrowDown,
-        "LEFT" => Code::ArrowLeft, "RIGHT" => Code::ArrowRight,
-        _ => return None,
-    })
+/// token -> 键位。数字和回车展开成两个键位（主键盘 + 小键盘）。
+fn token_to_codes(t: &str) -> Vec<Code> {
+    match t.to_uppercase().as_str() {
+        "0" => vec![Code::Digit0, Code::Numpad0],
+        "1" => vec![Code::Digit1, Code::Numpad1],
+        "2" => vec![Code::Digit2, Code::Numpad2],
+        "3" => vec![Code::Digit3, Code::Numpad3],
+        "4" => vec![Code::Digit4, Code::Numpad4],
+        "5" => vec![Code::Digit5, Code::Numpad5],
+        "6" => vec![Code::Digit6, Code::Numpad6],
+        "7" => vec![Code::Digit7, Code::Numpad7],
+        "8" => vec![Code::Digit8, Code::Numpad8],
+        "9" => vec![Code::Digit9, Code::Numpad9],
+        "ENTER" => vec![Code::Enter, Code::NumpadEnter],
+        "A" => vec![Code::KeyA], "B" => vec![Code::KeyB], "C" => vec![Code::KeyC],
+        "D" => vec![Code::KeyD], "E" => vec![Code::KeyE], "F" => vec![Code::KeyF],
+        "G" => vec![Code::KeyG], "H" => vec![Code::KeyH], "I" => vec![Code::KeyI],
+        "J" => vec![Code::KeyJ], "K" => vec![Code::KeyK], "L" => vec![Code::KeyL],
+        "M" => vec![Code::KeyM], "N" => vec![Code::KeyN], "O" => vec![Code::KeyO],
+        "P" => vec![Code::KeyP], "Q" => vec![Code::KeyQ], "R" => vec![Code::KeyR],
+        "S" => vec![Code::KeyS], "T" => vec![Code::KeyT], "U" => vec![Code::KeyU],
+        "V" => vec![Code::KeyV], "W" => vec![Code::KeyW], "X" => vec![Code::KeyX],
+        "Y" => vec![Code::KeyY], "Z" => vec![Code::KeyZ],
+        "F1" => vec![Code::F1], "F2" => vec![Code::F2], "F3" => vec![Code::F3],
+        "F4" => vec![Code::F4], "F5" => vec![Code::F5], "F6" => vec![Code::F6],
+        "F7" => vec![Code::F7], "F8" => vec![Code::F8], "F9" => vec![Code::F9],
+        "F10" => vec![Code::F10], "F11" => vec![Code::F11], "F12" => vec![Code::F12],
+        "SPACE" => vec![Code::Space], "TAB" => vec![Code::Tab],
+        "BACKSPACE" => vec![Code::Backspace], "INSERT" => vec![Code::Insert],
+        "DELETE" => vec![Code::Delete], "HOME" => vec![Code::Home], "END" => vec![Code::End],
+        "PAGEUP" => vec![Code::PageUp], "PAGEDOWN" => vec![Code::PageDown],
+        "UP" => vec![Code::ArrowUp], "DOWN" => vec![Code::ArrowDown],
+        "LEFT" => vec![Code::ArrowLeft], "RIGHT" => vec![Code::ArrowRight],
+        _ => Vec::new(),
+    }
 }
 
-/// 热键管理：注册一批快捷键，维护「热键 id -> 动作」的映射。
+/// 热键管理：注册一批快捷键，维护共享的「热键 id -> 动作」映射。
+/// 注意：manager 必须在主线程（有消息循环的线程）创建和注册。
 pub struct Hotkeys {
     mgr: GlobalHotKeyManager,
     current: Vec<HotKey>,
-    actions: HashMap<u32, HkAction>,
+    actions: SharedActions,
 }
 
 impl Hotkeys {
@@ -111,8 +133,13 @@ impl Hotkeys {
         Ok(Self {
             mgr: GlobalHotKeyManager::new().map_err(|e| anyhow::anyhow!("{e}"))?,
             current: Vec::new(),
-            actions: HashMap::new(),
+            actions: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    /// 给监听线程用的动作映射句柄。
+    pub fn actions_handle(&self) -> SharedActions {
+        self.actions.clone()
     }
 
     /// 注销当前所有热键。
@@ -121,38 +148,55 @@ impl Hotkeys {
             let _ = self.mgr.unregister_all(&self.current);
         }
         self.current.clear();
-        self.actions.clear();
-    }
-
-    /// 注册一个快捷键并绑定动作。返回是否成功（快捷键非法或被占用会失败）。
-    pub fn register(&mut self, combo: &str, action: HkAction) -> bool {
-        let Some(hk) = parse(combo) else {
-            log::warn!("无法解析快捷键「{combo}」");
-            return false;
-        };
-        match self.mgr.register(hk) {
-            Ok(()) => {
-                self.current.push(hk);
-                self.actions.insert(hk.id(), action);
-                true
-            }
-            Err(e) => {
-                log::warn!("注册快捷键「{combo}」失败（可能被其它程序占用）：{e}");
-                false
-            }
+        if let Ok(mut a) = self.actions.lock() {
+            a.clear();
         }
     }
 
-    /// 取出所有「本次刚被按下」的动作。在 UI 主循环里轮询调用。
-    pub fn poll(&self) -> Vec<HkAction> {
-        let mut out = Vec::new();
-        while let Ok(ev) = GlobalHotKeyEvent::receiver().try_recv() {
-            if ev.state == HotKeyState::Pressed {
-                if let Some(a) = self.actions.get(&ev.id) {
-                    out.push(a.clone());
+    /// 注册一个快捷键并绑定动作。数字键会同时注册主键盘和小键盘两个键位，
+    /// 任意一个注册成功就算成功。
+    pub fn register(&mut self, combo: &str, action: HkAction) -> bool {
+        let hks = parse_all(combo);
+        if hks.is_empty() {
+            log::warn!("无法解析快捷键「{combo}」");
+            return false;
+        }
+        let mut any_ok = false;
+        for hk in hks {
+            match self.mgr.register(hk) {
+                Ok(()) => {
+                    self.current.push(hk);
+                    if let Ok(mut a) = self.actions.lock() {
+                        a.insert(hk.id(), action.clone());
+                    }
+                    any_ok = true;
+                }
+                Err(e) => {
+                    log::warn!("注册快捷键「{combo}」失败（可能被其它程序占用）：{e}");
                 }
             }
         }
-        out
+        any_ok
     }
+}
+
+/// 在独立线程里阻塞监听热键事件，触发时回调 `on_action`。
+/// 不依赖 UI 刷帧，窗口被遮挡/最小化时也能响应。
+pub fn spawn_listener<F>(actions: SharedActions, on_action: F)
+where
+    F: Fn(HkAction) + Send + 'static,
+{
+    let _ = std::thread::Builder::new()
+        .name("hotkeys".into())
+        .spawn(move || {
+            let rx = GlobalHotKeyEvent::receiver();
+            while let Ok(ev) = rx.recv() {
+                if ev.state == HotKeyState::Pressed {
+                    let act = actions.lock().ok().and_then(|m| m.get(&ev.id).cloned());
+                    if let Some(a) = act {
+                        on_action(a);
+                    }
+                }
+            }
+        });
 }

@@ -11,7 +11,20 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+
+/// 重复按同一个快捷键时的行为。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum RepeatMode {
+    /// 停掉正在播的，从头重播。
+    #[default]
+    Restart,
+    /// 不停旧的，再叠一份一起播。
+    Overlap,
+    /// 第一次播放，再按一次停止。
+    Toggle,
+}
 
 /// 数据根目录：`%APPDATA%\VociePlayer\`（拿不到时退回当前目录）。
 pub fn data_root() -> PathBuf {
@@ -46,6 +59,10 @@ pub struct AppConfig {
     pub mic_passthrough: bool,
     /// 「停止所有音效」的全局快捷键，如 "Ctrl+Alt+X"。
     pub stop_hotkey: Option<String>,
+    /// 重复按同一个快捷键时的行为。
+    pub repeat_mode: RepeatMode,
+    /// 外部音效文件夹配置：名字 -> 任意位置的文件夹（profiles 目录之外）。
+    pub external_profiles: BTreeMap<String, PathBuf>,
     /// 开机自启（仅 Windows 生效）。
     pub autostart: bool,
 }
@@ -60,6 +77,8 @@ impl Default for AppConfig {
             effect_volume: 1.0,
             mic_passthrough: true,
             stop_hotkey: None,
+            repeat_mode: RepeatMode::default(),
+            external_profiles: BTreeMap::new(),
             autostart: false,
         }
     }

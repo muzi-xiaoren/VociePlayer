@@ -1,10 +1,15 @@
-//! egui 界面 + 状态管理，把配置、音频引擎、热键、profile 串起来。
+//! egui 界面 + 状态管理，把配置、音频线程、热键、profile 串起来。
+//!
+//! 音频跑在独立线程（见 `audio::spawn`），热键监听也在独立线程
+//! （见 `hotkeys::spawn_listener`），UI 只负责发命令 —— 窗口被游戏
+//! 遮挡、最小化时播放照常工作。
 
-use crate::audio::{self, AudioEngine};
-use crate::config::AppConfig;
+use crate::audio::{self, AudioCmd, AudioCtl};
+use crate::config::{AppConfig, RepeatMode};
 use crate::hotkeys::{self, HkAction, Hotkeys};
 use crate::platform;
 use crate::profile::{self, Profile, Sound};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 /// 正在为「谁」捕获快捷键。
@@ -20,6 +25,10 @@ struct Pending {
     rebuild_engine: bool,
     switch_profile: Option<String>,
     new_profile: Option<String>,
+    /// 弹出「选择文件夹」原生对话框，把选中的文件夹加成外部配置。
+    pick_folder: bool,
+    /// 移除一个外部文件夹配置（不删文件）。
+    remove_external: Option<String>,
     play: Vec<usize>,
     capture: Option<CaptureTarget>,
     clear_hotkey: Vec<usize>,
@@ -31,8 +40,7 @@ struct Pending {
 
 pub struct App {
     config: AppConfig,
-    engine: Option<AudioEngine>,
-    engine_error: Option<String>,
+    audio: AudioCtl,
     hotkeys: Option<Hotkeys>,
     profiles: Vec<String>,
     profile: Option<Profile>,
@@ -59,20 +67,26 @@ impl App {
             config.output_device = audio::guess_cable_output();
         }
 
-        // 确定当前 profile。
-        let profiles = profile::list_profiles();
+        // 确定当前 profile（内置 + 外部文件夹都算）。
+        let profiles = Self::all_profiles(&config);
         let active = config
             .active_profile
             .clone()
             .filter(|n| profiles.contains(n))
             .or_else(|| profiles.first().cloned());
         config.active_profile = active.clone();
-        let profile = active.as_deref().map(Profile::load);
+        let profile = active
+            .as_deref()
+            .map(|n| Profile::load(n, &Self::dir_for_config(&config, n)));
         let last_signature = profile
             .as_ref()
             .map(|p| Profile::file_signature(&p.dir))
             .unwrap_or_default();
 
+        // 音频线程
+        let audio = audio::spawn(config.clone());
+
+        // 全局热键：manager 在主线程建；事件监听放独立线程，直接驱动音频线程。
         let hotkeys = match Hotkeys::new() {
             Ok(h) => Some(h),
             Err(e) => {
@@ -80,11 +94,17 @@ impl App {
                 None
             }
         };
+        if let Some(hk) = &hotkeys {
+            let audio2 = audio.clone();
+            hotkeys::spawn_listener(hk.actions_handle(), move |a| match a {
+                HkAction::Play { path, volume } => audio2.send(AudioCmd::Play { path, volume }),
+                HkAction::StopAll => audio2.send(AudioCmd::StopAll),
+            });
+        }
 
         let mut app = Self {
             config,
-            engine: None,
-            engine_error: None,
+            audio,
             hotkeys,
             profiles,
             profile,
@@ -97,22 +117,36 @@ impl App {
             last_signature,
         };
         app.config.save();
-        app.rebuild_engine();
         app.reregister_hotkeys();
         app
     }
 
-    fn rebuild_engine(&mut self) {
-        match AudioEngine::new(&self.config) {
-            Ok(e) => {
-                self.engine = Some(e);
-                self.engine_error = None;
-            }
-            Err(e) => {
-                self.engine = None;
-                self.engine_error = Some(format!("{e:#}"));
+    /// 全部 profile 名：profiles 目录下的子文件夹 + 配置里记的外部文件夹。
+    fn all_profiles(cfg: &AppConfig) -> Vec<String> {
+        let mut names = profile::list_profiles();
+        for n in cfg.external_profiles.keys() {
+            if !names.contains(n) {
+                names.push(n.clone());
             }
         }
+        names.sort();
+        names
+    }
+
+    /// profile 名 -> 实际文件夹（外部配置优先）。
+    fn dir_for_config(cfg: &AppConfig, name: &str) -> PathBuf {
+        cfg.external_profiles
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| crate::config::profiles_dir().join(name))
+    }
+
+    fn dir_for(&self, name: &str) -> PathBuf {
+        Self::dir_for_config(&self.config, name)
+    }
+
+    fn rebuild_engine(&mut self) {
+        self.audio.send(AudioCmd::Rebuild(self.config.clone()));
     }
 
     fn reregister_hotkeys(&mut self) {
@@ -140,11 +174,42 @@ impl App {
 
     fn switch_profile(&mut self, name: &str) {
         self.config.active_profile = Some(name.to_string());
-        let p = Profile::load(name);
+        let dir = self.dir_for(name);
+        let p = Profile::load(name, &dir);
         self.last_signature = Profile::file_signature(&p.dir);
         self.profile = Some(p);
         self.config.save();
         self.reregister_hotkeys();
+    }
+
+    /// 把任意文件夹加成一个外部配置并切过去。名字取文件夹名，重名自动加序号。
+    fn add_external_folder(&mut self, dir: PathBuf) {
+        // 同一个文件夹已经加过：直接切过去
+        if let Some(name) = self
+            .config
+            .external_profiles
+            .iter()
+            .find(|(_, d)| **d == dir)
+            .map(|(n, _)| n.clone())
+        {
+            self.switch_profile(&name);
+            return;
+        }
+        let base = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(String::from)
+            .unwrap_or_else(|| dir.display().to_string());
+        let mut name = base.clone();
+        let mut i = 2;
+        while self.profiles.contains(&name) {
+            name = format!("{base} ({i})");
+            i += 1;
+        }
+        self.config.external_profiles.insert(name.clone(), dir);
+        self.config.save();
+        self.profiles = Self::all_profiles(&self.config);
+        self.switch_profile(&name);
     }
 
     fn refresh_devices(&mut self) {
@@ -164,7 +229,7 @@ impl App {
             let sig = Profile::file_signature(&dir);
             if sig != self.last_signature {
                 self.last_signature = sig;
-                self.profile = Some(Profile::load(&name));
+                self.profile = Some(Profile::load(&name, &dir));
                 self.reregister_hotkeys();
             }
         }
@@ -227,7 +292,6 @@ impl App {
                 }
                 p.save_bindings();
             }
-            let _ = i;
             need_reregister = true;
         }
 
@@ -248,9 +312,12 @@ impl App {
         }
 
         for i in pending.play {
-            if let (Some(p), Some(e)) = (&self.profile, &self.engine) {
+            if let Some(p) = &self.profile {
                 if let Some(s) = p.sounds.get(i) {
-                    e.play(&s.path, s.volume);
+                    self.audio.send(AudioCmd::Play {
+                        path: s.path.clone(),
+                        volume: s.volume,
+                    });
                 }
             }
         }
@@ -265,12 +332,52 @@ impl App {
             self.capturing = Some(t);
         }
 
-        if let Some(name) = pending.new_profile {
-            let name = name.trim().to_string();
-            if !name.is_empty() && profile::create_profile(&name).is_ok() {
-                self.profiles = profile::list_profiles();
-                self.switch_profile(&name);
-                self.new_profile_name.clear();
+        // 「新建配置」：普通名字 = profiles 下新建子文件夹；
+        // 粘贴的是绝对路径 = 当成外部文件夹加进来。
+        if let Some(input) = pending.new_profile {
+            let input = input.trim().to_string();
+            if !input.is_empty() {
+                let p = PathBuf::from(&input);
+                if p.is_absolute() {
+                    if p.is_dir() || std::fs::create_dir_all(&p).is_ok() {
+                        self.add_external_folder(p);
+                        self.new_profile_name.clear();
+                    }
+                } else if !input.contains('/')
+                    && !input.contains('\\')
+                    && profile::create_profile(&input).is_ok()
+                {
+                    self.profiles = Self::all_profiles(&self.config);
+                    self.switch_profile(&input);
+                    self.new_profile_name.clear();
+                }
+            }
+        }
+
+        // 原生「选择文件夹」对话框（有确定按钮）。
+        if pending.pick_folder {
+            if let Some(dir) = rfd::FileDialog::new()
+                .set_title("选择音效文件夹")
+                .pick_folder()
+            {
+                self.add_external_folder(dir);
+            }
+        }
+
+        if let Some(name) = pending.remove_external {
+            self.config.external_profiles.remove(&name);
+            self.profiles = Self::all_profiles(&self.config);
+            if self.config.active_profile.as_deref() == Some(name.as_str()) {
+                if let Some(first) = self.profiles.first().cloned() {
+                    self.switch_profile(&first);
+                } else {
+                    self.config.active_profile = None;
+                    self.profile = None;
+                    self.config.save();
+                    need_reregister = true;
+                }
+            } else {
+                self.config.save();
             }
         }
 
@@ -353,9 +460,8 @@ impl App {
             .checkbox(&mut self.config.mic_passthrough, "转发麦克风（边说话边放音效）")
             .changed()
         {
-            if let Some(e) = &self.engine {
-                e.set_mic_passthrough(self.config.mic_passthrough);
-            }
+            self.audio
+                .send(AudioCmd::SetMicPassthrough(self.config.mic_passthrough));
             self.config.save();
         }
 
@@ -364,9 +470,27 @@ impl App {
             ui.label("音效音量");
             let resp = ui.add(egui::Slider::new(&mut self.config.effect_volume, 0.0..=1.5));
             if resp.changed() {
-                if let Some(e) = &mut self.engine {
-                    e.set_effect_volume(self.config.effect_volume);
-                }
+                self.audio
+                    .send(AudioCmd::SetEffectVolume(self.config.effect_volume));
+                self.config.save();
+            }
+        });
+
+        // —— 重复按键行为 ——
+        ui.horizontal(|ui| {
+            ui.label("重复按同一键：");
+            let mut changed = false;
+            changed |= ui
+                .selectable_value(&mut self.config.repeat_mode, RepeatMode::Restart, "从头重播")
+                .clicked();
+            changed |= ui
+                .selectable_value(&mut self.config.repeat_mode, RepeatMode::Overlap, "叠加再播")
+                .clicked();
+            changed |= ui
+                .selectable_value(&mut self.config.repeat_mode, RepeatMode::Toggle, "一按播 / 再按停")
+                .clicked();
+            if changed {
+                self.audio.send(AudioCmd::SetRepeatMode(self.config.repeat_mode));
                 self.config.save();
             }
         });
@@ -383,7 +507,7 @@ impl App {
         }
 
         // —— 引擎错误 ——
-        if let Some(err) = &self.engine_error {
+        if let Some(err) = self.audio.last_error() {
             ui.separator();
             ui.colored_label(egui::Color32::from_rgb(210, 70, 70), format!("音频引擎错误：{err}"));
             if ui.button("重试").clicked() {
@@ -411,7 +535,12 @@ impl App {
                 .show_ui(ui, |ui| {
                     for name in profiles {
                         let selected = self.config.active_profile.as_deref() == Some(name);
-                        if ui.selectable_label(selected, name).clicked() && !selected {
+                        let label = if self.config.external_profiles.contains_key(name) {
+                            format!("📁 {name}")
+                        } else {
+                            name.clone()
+                        };
+                        if ui.selectable_label(selected, label).clicked() && !selected {
                             pending.switch_profile = Some(name.clone());
                         }
                     }
@@ -419,12 +548,35 @@ impl App {
             if ui.button("📂 打开文件夹").clicked() {
                 pending.open_folder = true;
             }
+            // 外部文件夹配置可以移除（只解除关联，不删文件）
+            let is_external = self
+                .config
+                .active_profile
+                .as_ref()
+                .map(|n| self.config.external_profiles.contains_key(n))
+                .unwrap_or(false);
+            if is_external
+                && ui
+                    .button("✖ 移除")
+                    .on_hover_text("从列表移除这个外部文件夹（不删除文件）")
+                    .clicked()
+            {
+                pending.remove_external = self.config.active_profile.clone();
+            }
         });
         ui.horizontal(|ui| {
             ui.label("新建配置：");
-            ui.text_edit_singleline(&mut self.new_profile_name);
+            ui.text_edit_singleline(&mut self.new_profile_name)
+                .on_hover_text("输入名字新建；也可以直接粘贴一个文件夹的完整路径");
             if ui.button("新建").clicked() {
                 pending.new_profile = Some(self.new_profile_name.clone());
+            }
+            if ui
+                .button("📁 选择文件夹…")
+                .on_hover_text("把电脑上任意一个装音效的文件夹加成配置")
+                .clicked()
+            {
+                pending.pick_folder = true;
             }
         });
 
@@ -495,33 +647,16 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 让主循环持续跑，才能轮询热键、重扫文件夹。
-        ctx.request_repaint_after(Duration::from_millis(150));
+        // 热键和播放都在独立线程，这里的定时刷帧只为文件夹自动重扫。
+        ctx.request_repaint_after(Duration::from_millis(500));
 
-        // 1) 处理全局热键事件
-        let actions = self.hotkeys.as_ref().map(|h| h.poll()).unwrap_or_default();
-        for a in actions {
-            match a {
-                HkAction::Play { path, volume } => {
-                    if let Some(e) = &self.engine {
-                        e.play(&path, volume);
-                    }
-                }
-                HkAction::StopAll => {
-                    if let Some(e) = &self.engine {
-                        e.stop_all();
-                    }
-                }
-            }
-        }
-
-        // 2) 文件夹自动重扫
+        // 1) 文件夹自动重扫
         self.maybe_rescan();
 
-        // 3) 快捷键捕获
+        // 2) 快捷键捕获
         self.handle_capture(ctx);
 
-        // 4) 界面（设备/profile 列表先克隆成局部，避开借用冲突）
+        // 3) 界面（设备/profile 列表先克隆成局部，避开借用冲突）
         let out_devices = self.out_devices.clone();
         let in_devices = self.in_devices.clone();
         let profiles = self.profiles.clone();
@@ -537,7 +672,7 @@ impl eframe::App for App {
             self.ui_sounds(ui, &profiles, &sounds, &mut pending);
         });
 
-        // 5) 帧末统一处理
+        // 4) 帧末统一处理
         self.apply(pending);
     }
 }

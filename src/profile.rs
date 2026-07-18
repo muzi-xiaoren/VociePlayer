@@ -82,8 +82,9 @@ impl Profile {
     }
 
     /// 扫描文件夹、合并 `_bindings.json`，加载出 profile。
-    pub fn load(name: &str) -> Self {
-        let dir = crate::config::profiles_dir().join(name);
+    /// `dir` 可以是 profiles 下的子文件夹，也可以是用户选的任意外部文件夹。
+    pub fn load(name: &str, dir: &Path) -> Self {
+        let dir = dir.to_path_buf();
         let _ = std::fs::create_dir_all(&dir);
 
         // 读已有绑定
